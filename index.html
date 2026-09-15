@@ -33,16 +33,31 @@
   #status { margin-top: 12px; font-size: 14px; color: #4b5563; min-height: 18px; }
   #interim { margin-top: 4px; font-size: 13px; color: #9ca3af; font-style: italic; min-height: 16px; }
 
+  #finishBar { padding: 0 14px 12px; display: none; }
+  #finishBar.show { display: block; }
+  #finishBtn {
+    width: 100%; padding: 12px; border-radius: 10px; border: none;
+    background: #16a34a; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  #finishBtn:disabled { background: #9ca3af; }
+  #pendingCount { text-align: center; font-size: 12px; color: #6b7280; margin: 6px 0 10px; }
+
   #log { flex: 1; overflow-y: auto; padding: 10px 14px 30px; display: flex; flex-direction: column; gap: 8px; }
   .entry {
     background: #fff; border-radius: 10px; padding: 10px 12px; border-left: 4px solid #9ca3af;
-    box-shadow: 0 1px 2px rgba(0,0,0,.05); font-size: 14px;
+    box-shadow: 0 1px 2px rgba(0,0,0,.05); font-size: 14px; position: relative;
   }
+  .entry.pending { border-left-color: #6366f1; }
+  .entry.processing { border-left-color: #6366f1; opacity: .7; }
   .entry.saved { border-left-color: #16a34a; }
   .entry.review { border-left-color: #d97706; }
   .entry.nomatch { border-left-color: #dc2626; }
-  .entry .transcript { font-weight: 600; color: #1c1f24; }
+  .entry .transcript { font-weight: 600; color: #1c1f24; padding-right: 26px; }
   .entry .detail { margin-top: 3px; color: #4b5563; font-size: 13px; }
+  .entry .removeBtn {
+    position: absolute; top: 8px; right: 8px; border: none; background: none;
+    color: #9ca3af; font-size: 16px; line-height: 1; cursor: pointer; padding: 4px;
+  }
   .alts { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .alts button {
     border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 6px 10px;
@@ -66,7 +81,7 @@
 
 <header>
   <h1>Prospect Voice Stocktake</h1>
-  <p>Walk the coolroom and speak items — this page runs outside Apps Script so the mic actually works.</p>
+  <p>Walk the coolroom and speak items. Nothing is sent anywhere until you tap "Finish &amp; Save" — capturing is instant and works offline.</p>
 </header>
 
 <div id="setupNotice"></div>
@@ -77,11 +92,17 @@
   <div id="interim"></div>
 </div>
 
+<div id="finishBar">
+  <div id="pendingCount"></div>
+  <button id="finishBtn">Finish &amp; Save to Sheet</button>
+</div>
+
 <div id="log"></div>
 
 <div id="urlBar">
   <input id="endpointInput" type="text" placeholder="Prospect Web App /exec URL" />
   <button id="saveEndpoint">Save</button>
+  <button id="testConnectionBtn">Test</button>
 </div>
 
 <script>
@@ -99,6 +120,9 @@ var micToggle = document.getElementById('micToggle');
 var statusEl = document.getElementById('status');
 var interimEl = document.getElementById('interim');
 var logEl = document.getElementById('log');
+var finishBar = document.getElementById('finishBar');
+var finishBtn = document.getElementById('finishBtn');
+var pendingCountEl = document.getElementById('pendingCount');
 
 function getEndpoint() {
   return localStorage.getItem('endpoint') || DEFAULT_ENDPOINT;
@@ -108,6 +132,7 @@ saveEndpointBtn.addEventListener('click', function () {
   var v = endpointInput.value.trim();
   if (v) { localStorage.setItem('endpoint', v); statusEl.textContent = 'Endpoint saved.'; }
 });
+document.getElementById('testConnectionBtn').addEventListener('click', testConnection);
 
 function callBackend(payload) {
   return fetch(getEndpoint(), {
@@ -117,9 +142,40 @@ function callBackend(payload) {
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
     body: JSON.stringify(payload)
   }).then(function (r) {
-    if (!r.ok) throw new Error('Server error (' + r.status + ')');
-    return r.json();
+    if (!r.ok) {
+      return r.text().then(function (t) {
+        throw new Error('Server responded ' + r.status + ': ' + t.substring(0, 200));
+      });
+    }
+    return r.text().then(function (t) {
+      try {
+        return JSON.parse(t);
+      } catch (e) {
+        // Got a response, but it wasn't JSON — almost always means the
+        // request was redirected to a Google sign-in/consent page, which
+        // means the deployment's "Who has access" isn't set to "Anyone".
+        throw new Error('Got a non-JSON response (likely a Google sign-in page). Check the deployment\'s "Who has access" is set to "Anyone", not "Anyone with Google account". First 150 chars: ' + t.substring(0, 150));
+      }
+    });
+  }).catch(function (err) {
+    // "Failed to fetch" itself carries no detail — annotate it so the
+    // on-screen error is actually useful.
+    if (err instanceof TypeError && /fetch/i.test(err.message)) {
+      throw new Error('Network/CORS block before any response arrived. Common causes: (1) the endpoint URL below is wrong or stale, (2) the deployment\'s "Who has access" isn\'t set to "Anyone", (3) this device has no internet. Endpoint used: ' + getEndpoint());
+    }
+    throw err;
   });
+}
+
+function testConnection() {
+  statusEl.textContent = 'Testing connection…';
+  callBackend({ action: 'parse', phrase: 'test' })
+    .then(function (res) {
+      statusEl.textContent = res.error ? ('Reached server, but it replied with an error: ' + res.message) : 'Connection OK — server responded.';
+    })
+    .catch(function (err) {
+      statusEl.textContent = 'Connection failed: ' + (err.message || err);
+    });
 }
 
 // ---- Speech recognition ----
@@ -142,7 +198,7 @@ function ensureRecognition() {
     for (var i = event.resultIndex; i < event.results.length; i++) {
       var res = event.results[i];
       if (res.isFinal) {
-        handlePhrase(res[0].transcript.trim());
+        capturePhrase(res[0].transcript.trim());
         interim = '';
       } else {
         interim += res[0].transcript;
@@ -195,23 +251,108 @@ micToggle.addEventListener('click', function () {
   if (listening) stopListening(); else startListening();
 });
 
-// ---- Phrase handling ----
-var entryCounter = 0;
+// ---- Local capture (no network at all during recording) ----
+// pending = [{id, transcript}], persisted to localStorage so a refresh or
+// dropped connection mid-walk doesn't lose anything already captured.
+var pending = loadPending();
+var entryCounter = pending.reduce(function (max, p) {
+  var n = parseInt(p.id.replace('e', ''), 10);
+  return isNaN(n) ? max : Math.max(max, n);
+}, 0);
 
-function handlePhrase(transcript) {
+function loadPending() {
+  try {
+    return JSON.parse(localStorage.getItem('pendingPhrases') || '[]');
+  } catch (e) {
+    return [];
+  }
+}
+function savePending() {
+  localStorage.setItem('pendingPhrases', JSON.stringify(pending));
+}
+
+function capturePhrase(transcript) {
   if (!transcript) return;
   entryCounter += 1;
   var id = 'e' + entryCounter;
-  var div = document.createElement('div');
-  div.className = 'entry';
-  div.id = id;
-  div.innerHTML = '<div class="transcript">' + escapeHtml(transcript) + '</div><div class="detail">Checking…</div>';
-  logEl.insertBefore(div, logEl.firstChild);
-
-  callBackend({ action: 'parse', phrase: transcript })
-    .then(function (result) { renderResult(id, result); })
-    .catch(function (err) { renderError(id, err.message || String(err)); });
+  pending.push({ id: id, transcript: transcript });
+  savePending();
+  renderPendingEntry(id, transcript);
+  updateFinishBar();
 }
+
+function renderPendingEntry(id, transcript) {
+  var div = document.createElement('div');
+  div.className = 'entry pending';
+  div.id = id;
+  div.innerHTML =
+    '<button class="removeBtn" aria-label="Remove">✕</button>' +
+    '<div class="transcript">' + escapeHtml(transcript) + '</div>' +
+    '<div class="detail">Captured — will process on Finish</div>';
+  div.querySelector('.removeBtn').addEventListener('click', function () {
+    pending = pending.filter(function (p) { return p.id !== id; });
+    savePending();
+    div.remove();
+    updateFinishBar();
+  });
+  logEl.insertBefore(div, logEl.firstChild);
+}
+
+function updateFinishBar() {
+  var count = pending.length;
+  finishBar.className = count > 0 ? 'show' : '';
+  pendingCountEl.textContent = count === 1 ? '1 item captured' : (count + ' items captured');
+}
+
+// Restore any pending entries left over from before a refresh (oldest first,
+// so newest still ends up at the top of the log to match live capture order).
+pending.slice().reverse().forEach(function (p) { renderPendingEntry(p.id, p.transcript); });
+updateFinishBar();
+
+// ---- Finish & Save: one batched call for everything captured ----
+finishBtn.addEventListener('click', function () {
+  if (!pending.length) return;
+  stopListening();
+  finishBtn.disabled = true;
+  finishBtn.textContent = 'Saving…';
+
+  var batch = pending.slice(); // snapshot — new phrases captured after this point start a fresh pending list
+  batch.forEach(function (p) {
+    var div = document.getElementById(p.id);
+    if (div) {
+      div.className = 'entry processing';
+      div.querySelector('.detail').textContent = 'Processing…';
+      var rm = div.querySelector('.removeBtn');
+      if (rm) rm.remove();
+    }
+  });
+
+  callBackend({ action: 'batchParse', phrases: batch.map(function (p) { return p.transcript; }) })
+    .then(function (res) {
+      if (res && res.error) {
+        batch.forEach(function (p) { renderError(p.id, res.message); });
+        return;
+      }
+      var results = res || [];
+      batch.forEach(function (p, i) {
+        renderResult(p.id, results[i] || { error: true, message: 'No result returned for this item.' });
+      });
+      // Everything in this snapshot has been sent — drop it from the
+      // pending queue (anything captured while this was in flight stays).
+      var sentIds = {};
+      batch.forEach(function (p) { sentIds[p.id] = true; });
+      pending = pending.filter(function (p) { return !sentIds[p.id]; });
+      savePending();
+    })
+    .catch(function (err) {
+      batch.forEach(function (p) { renderError(p.id, err.message || String(err)); });
+    })
+    .finally(function () {
+      finishBtn.disabled = false;
+      finishBtn.textContent = 'Finish & Save to Sheet';
+      updateFinishBar();
+    });
+});
 
 function describeValue(result) {
   if (result.mode === 'NIL') return 'NIL';
@@ -235,14 +376,12 @@ function renderResult(id, result) {
 
   if (result.matched || (result.alternates && result.alternates.length)) {
     div.className = 'entry review';
+    var detail = div.querySelector('.detail');
+    detail.textContent = 'Not sure which product — confirm: ' + describeValue(result);
+
     var names = [];
     if (result.matched) names.push(result.product);
     (result.alternates || []).forEach(function (n) { if (names.indexOf(n) === -1) names.push(n); });
-
-    var detail = document.createElement('div');
-    detail.className = 'detail';
-    detail.textContent = 'Not sure which product — confirm: ' + describeValue(result);
-    div.appendChild(detail);
 
     var alts = document.createElement('div');
     alts.className = 'alts';
@@ -269,7 +408,8 @@ function renderError(id, message) {
   var div = document.getElementById(id);
   if (!div) return;
   div.className = 'entry nomatch';
-  div.querySelector('.detail').textContent = 'Error: ' + message;
+  var detail = div.querySelector('.detail');
+  if (detail) detail.textContent = 'Error: ' + message;
 }
 
 function confirmEntry(id, productName, result) {
