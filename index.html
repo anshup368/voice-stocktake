@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Prospect Voice Stocktake</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    background: #f4f5f7; color: #1c1f24; min-height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 16px 18px 12px; background: #1c1f24; color: #fff;
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  header p { margin: 4px 0 0; font-size: 12px; color: #b7bcc4; }
+
+  #stage { padding: 22px 18px 10px; text-align: center; }
+  #micToggle {
+    width: 96px; height: 96px; border-radius: 50%; border: none;
+    background: #2563eb; color: #fff; font-size: 34px; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 14px rgba(37,99,235,.35);
+  }
+  #micToggle.listening { background: #dc2626; animation: pulse 1.4s infinite; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(220,38,38,.45); }
+    70% { box-shadow: 0 0 0 22px rgba(220,38,38,0); }
+    100% { box-shadow: 0 0 0 0 rgba(220,38,38,0); }
+  }
+  #status { margin-top: 12px; font-size: 14px; color: #4b5563; min-height: 18px; }
+  #interim { margin-top: 4px; font-size: 13px; color: #9ca3af; font-style: italic; min-height: 16px; }
+
+  #log { flex: 1; overflow-y: auto; padding: 10px 14px 30px; display: flex; flex-direction: column; gap: 8px; }
+  .entry {
+    background: #fff; border-radius: 10px; padding: 10px 12px; border-left: 4px solid #9ca3af;
+    box-shadow: 0 1px 2px rgba(0,0,0,.05); font-size: 14px;
+  }
+  .entry.saved { border-left-color: #16a34a; }
+  .entry.review { border-left-color: #d97706; }
+  .entry.nomatch { border-left-color: #dc2626; }
+  .entry .transcript { font-weight: 600; color: #1c1f24; }
+  .entry .detail { margin-top: 3px; color: #4b5563; font-size: 13px; }
+  .alts { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .alts button {
+    border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 6px 10px;
+    font-size: 13px; cursor: pointer;
+  }
+  .alts button.dismiss { color: #6b7280; }
+
+  #setupNotice {
+    margin: 14px; padding: 12px 14px; background: #fff7ed; border: 1px solid #fdba74;
+    border-radius: 10px; font-size: 13px; color: #7c2d12; display: none;
+  }
+  #setupNotice.show { display: block; }
+  #urlBar { display: flex; gap: 6px; padding: 10px 14px; background: #fff; border-top: 1px solid #e5e7eb; }
+  #urlBar input {
+    flex: 1; padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 12px;
+  }
+  #urlBar button { padding: 8px 12px; border-radius: 8px; border: 1px solid #d1d5db; background: #f3f4f6; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Prospect Voice Stocktake</h1>
+  <p>Walk the coolroom and speak items — this page runs outside Apps Script so the mic actually works.</p>
+</header>
+
+<div id="setupNotice"></div>
+
+<div id="stage">
+  <button id="micToggle">🎤</button>
+  <div id="status">Tap the mic to start</div>
+  <div id="interim"></div>
+</div>
+
+<div id="log"></div>
+
+<div id="urlBar">
+  <input id="endpointInput" type="text" placeholder="Prospect Web App /exec URL" />
+  <button id="saveEndpoint">Save</button>
+</div>
+
+<script>
+// ---- Config: the Prospect Stocktake Web App /exec URL ----
+// Pre-filled below. If you ever redeploy and the URL changes (it normally
+// doesn't when you use "Manage deployments > New version"), update it here,
+// or just paste the new one into the box at the bottom of the page — it's
+// remembered on this device via localStorage.
+var DEFAULT_ENDPOINT = 'https://script.google.com/macros/s/AKfycbyP-HVG4RPbuTAfn1-6D3iKsDKpy1gA92LZepLnYQHcKBNsqM3wUTzUuPVFsKUzEk10/exec';
+
+var endpointInput = document.getElementById('endpointInput');
+var saveEndpointBtn = document.getElementById('saveEndpoint');
+var setupNotice = document.getElementById('setupNotice');
+var micToggle = document.getElementById('micToggle');
+var statusEl = document.getElementById('status');
+var interimEl = document.getElementById('interim');
+var logEl = document.getElementById('log');
+
+function getEndpoint() {
+  return localStorage.getItem('endpoint') || DEFAULT_ENDPOINT;
+}
+endpointInput.value = getEndpoint();
+saveEndpointBtn.addEventListener('click', function () {
+  var v = endpointInput.value.trim();
+  if (v) { localStorage.setItem('endpoint', v); statusEl.textContent = 'Endpoint saved.'; }
+});
+
+function callBackend(payload) {
+  return fetch(getEndpoint(), {
+    method: 'POST',
+    // text/plain avoids a CORS preflight, which Apps Script web apps can't
+    // reliably answer. The body is still JSON text underneath.
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload)
+  }).then(function (r) {
+    if (!r.ok) throw new Error('Server error (' + r.status + ')');
+    return r.json();
+  });
+}
+
+// ---- Speech recognition ----
+var SpeechRecognitionImpl = window.SpeechRecognition || window.webkitSpeechRecognition;
+var recognition = null;
+var listening = false;
+var shouldRestart = false;
+
+function voiceSupported() { return !!SpeechRecognitionImpl; }
+
+function ensureRecognition() {
+  if (recognition) return recognition;
+  recognition = new SpeechRecognitionImpl();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = 'en-AU';
+
+  recognition.onresult = function (event) {
+    var interim = '';
+    for (var i = event.resultIndex; i < event.results.length; i++) {
+      var res = event.results[i];
+      if (res.isFinal) {
+        handlePhrase(res[0].transcript.trim());
+        interim = '';
+      } else {
+        interim += res[0].transcript;
+      }
+    }
+    interimEl.textContent = interim;
+  };
+
+  recognition.onerror = function (event) {
+    statusEl.textContent = 'Mic error: ' + event.error + '. Tap the mic to try again.';
+    shouldRestart = false;
+    setListening(false);
+  };
+
+  recognition.onend = function () {
+    if (shouldRestart) {
+      try { recognition.start(); } catch (e) { /* ignore rapid restart errors */ }
+    } else {
+      setListening(false);
+    }
+  };
+
+  return recognition;
+}
+
+function setListening(on) {
+  listening = on;
+  micToggle.classList.toggle('listening', on);
+  statusEl.textContent = on ? 'Listening — speak naturally, item by item' : 'Tap the mic to start';
+  if (!on) interimEl.textContent = '';
+}
+
+function startListening() {
+  if (!voiceSupported()) {
+    statusEl.textContent = 'This browser does not support voice input. Use Chrome.';
+    return;
+  }
+  shouldRestart = true;
+  setListening(true);
+  try { ensureRecognition().start(); } catch (e) { /* already started */ }
+}
+
+function stopListening() {
+  shouldRestart = false;
+  setListening(false);
+  if (recognition) { try { recognition.stop(); } catch (e) {} }
+}
+
+micToggle.addEventListener('click', function () {
+  if (listening) stopListening(); else startListening();
+});
+
+// ---- Phrase handling ----
+var entryCounter = 0;
+
+function handlePhrase(transcript) {
+  if (!transcript) return;
+  entryCounter += 1;
+  var id = 'e' + entryCounter;
+  var div = document.createElement('div');
+  div.className = 'entry';
+  div.id = id;
+  div.innerHTML = '<div class="transcript">' + escapeHtml(transcript) + '</div><div class="detail">Checking…</div>';
+  logEl.insertBefore(div, logEl.firstChild);
+
+  callBackend({ action: 'parse', phrase: transcript })
+    .then(function (result) { renderResult(id, result); })
+    .catch(function (err) { renderError(id, err.message || String(err)); });
+}
+
+function describeValue(result) {
+  if (result.mode === 'NIL') return 'NIL';
+  if (result.mode === 'TICK') return '✓ In stock';
+  if (result.mode === 'TBC') return 'TBC';
+  if (result.mode === 'NUMBER') return (result.qty || '') + (result.unit ? ' ' + result.unit : '');
+  return '';
+}
+
+function renderResult(id, result) {
+  var div = document.getElementById(id);
+  if (!div) return;
+
+  if (result.error) { renderError(id, result.message); return; }
+
+  if (result.saved) {
+    div.className = 'entry saved';
+    div.querySelector('.detail').textContent = '✓ Saved: ' + result.product + ' — ' + describeValue(result);
+    return;
+  }
+
+  if (result.matched || (result.alternates && result.alternates.length)) {
+    div.className = 'entry review';
+    var names = [];
+    if (result.matched) names.push(result.product);
+    (result.alternates || []).forEach(function (n) { if (names.indexOf(n) === -1) names.push(n); });
+
+    var detail = document.createElement('div');
+    detail.className = 'detail';
+    detail.textContent = 'Not sure which product — confirm: ' + describeValue(result);
+    div.appendChild(detail);
+
+    var alts = document.createElement('div');
+    alts.className = 'alts';
+    names.forEach(function (name) {
+      var btn = document.createElement('button');
+      btn.textContent = name;
+      btn.addEventListener('click', function () { confirmEntry(id, name, result); });
+      alts.appendChild(btn);
+    });
+    var skip = document.createElement('button');
+    skip.className = 'dismiss';
+    skip.textContent = 'Skip';
+    skip.addEventListener('click', function () { div.className = 'entry'; alts.remove(); });
+    alts.appendChild(skip);
+    div.appendChild(alts);
+    return;
+  }
+
+  div.className = 'entry nomatch';
+  div.querySelector('.detail').textContent = 'No product match — say it again, or enter it manually later.';
+}
+
+function renderError(id, message) {
+  var div = document.getElementById(id);
+  if (!div) return;
+  div.className = 'entry nomatch';
+  div.querySelector('.detail').textContent = 'Error: ' + message;
+}
+
+function confirmEntry(id, productName, result) {
+  // Send the product name; the backend looks up the row itself, since the
+  // chosen name might be one of the alternates rather than the best guess.
+  callBackend({
+    action: 'confirm',
+    productName: productName,
+    mode: result.mode,
+    qty: result.qty,
+    unit: result.unit
+  }).then(function (res) {
+    var div = document.getElementById(id);
+    if (!div) return;
+    if (res.error) { renderError(id, res.message); return; }
+    div.className = 'entry saved';
+    div.innerHTML = '<div class="transcript">' + escapeHtml(productName) + '</div><div class="detail">✓ Saved: ' + describeValue(result) + '</div>';
+  }).catch(function (err) { renderError(id, err.message || String(err)); });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+if (!voiceSupported()) {
+  setupNotice.className = 'show';
+  setupNotice.textContent = 'This browser does not support voice input (Web Speech API). Please open this page in Chrome.';
+}
+if (!location.protocol.startsWith('https') && location.hostname !== 'localhost') {
+  setupNotice.className = 'show';
+  setupNotice.textContent = 'This page must be served over HTTPS for the microphone to work (e.g. via GitHub Pages).';
+}
+</script>
+</body>
+</html>
